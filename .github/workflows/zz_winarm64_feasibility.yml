@@ -42,6 +42,12 @@ jobs:
           python -c "import sys, platform, sysconfig; print(sys.version, platform.machine(), sysconfig.get_platform())"
           (clang --version || true)
           df -h || true
+      - name: Install protoc (pixi normally provides it; needed by lance/prost-build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v33.5/protoc-33.5-win64.zip -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath "$env:RUNNER_TEMP\protoc"
+          "PROTOC=$env:RUNNER_TEMP\protoc\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Generate pyo3-build.cfg (what pixi activation normally does)
         shell: bash
         run: |
@@ -83,13 +89,19 @@ jobs:
             build-wheel.log
 
   cli:
-    name: rerun-cli (${{ matrix.features }})
+    name: rerun-cli (${{ matrix.features }} ${{ matrix.cc }})
     runs-on: windows-11-arm
     timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
-        features: [release_no_web_viewer, base]
+        include:
+          - features: release_no_web_viewer
+            cc: ""
+          # (base without cc override already covered by run 38311288526)
+          # rav1d asm (.S, GNU syntax) is not accepted by cl.exe; try clang-cl
+          - features: release_no_web_viewer
+            cc: clang-cl
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -111,6 +123,12 @@ jobs:
           rustc -vV
           (nasm -v || echo "no nasm")
           (clang --version || true)
+      - name: Install protoc (pixi normally provides it; needed by lance/prost-build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v33.5/protoc-33.5-win64.zip -OutFile protoc.zip
+          Expand-Archive protoc.zip -DestinationPath "$env:RUNNER_TEMP\protoc"
+          "PROTOC=$env:RUNNER_TEMP\protoc\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Generate pyo3-build.cfg (what pixi activation normally does)
         shell: bash
         run: |
@@ -118,7 +136,10 @@ jobs:
           cat rerun_py/pyo3-build.cfg
       - name: Build rerun-cli
         shell: bash
+        env:
+          CC_aarch64_pc_windows_msvc: ${{ matrix.cc }}
         run: |
+          if [ -z "${CC_aarch64_pc_windows_msvc}" ]; then unset CC_aarch64_pc_windows_msvc; fi
           cargo build --locked --release -p rerun-cli --no-default-features \
             --features "${{ matrix.features }}" 2>&1 | tee build-cli.log
       - name: Smoke
@@ -134,7 +155,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rerun-cli-win-arm64-${{ matrix.features }}
+          name: rerun-cli-win-arm64-${{ matrix.features }}-${{ matrix.cc || 'cl' }}
           path: |
             target/release/rerun.exe
             build-cli.log
