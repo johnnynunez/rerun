@@ -1,0 +1,140 @@
+# Verification-only workflow (fork branch, never proposed upstream).
+# Purpose: does rerun's Rust code (rerun_py bindings + rerun-cli) compile natively
+# for aarch64-pc-windows-msvc on the hosted windows-11-arm runner?
+name: winarm64 feasibility (verification only)
+
+on:
+  push:
+    branches: [winarm64-feasibility]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  wheel:
+    name: rerun_py wheel (PR-mode features)
+    runs-on: windows-11-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: arm64
+      - name: Install rustup if missing
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain none --profile minimal
+            "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - name: Toolchain info
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustc -vV
+          python -c "import sys, platform, sysconfig; print(sys.version, platform.machine(), sysconfig.get_platform())"
+          (clang --version || true)
+          df -h || true
+      - name: Generate pyo3-build.cfg (what pixi activation normally does)
+        shell: bash
+        run: |
+          python -c "import sys; sys.path.insert(0, 'rerun_pixi_env/src'); from pathlib import Path; from rerun_pixi_env.pyo3_config import generate_config_file; generate_config_file(Path('rerun_py/pyo3-build.cfg'))"
+          cat rerun_py/pyo3-build.cfg
+      - name: Build wheel
+        shell: bash
+        env:
+          RERUN_ALLOW_MISSING_BIN: "1"
+        run: |
+          python -m pip install "maturin>=1.9,<2"
+          maturin build --manifest-path rerun_py/Cargo.toml --release \
+            --target aarch64-pc-windows-msvc \
+            --no-default-features --features perf_telemetry,extension-module \
+            --out dist 2>&1 | tee build-wheel.log
+      - name: Inspect wheel
+        if: always()
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import glob, zipfile, struct, json
+          out = []
+          for w in glob.glob("dist/*.whl"):
+              z = zipfile.ZipFile(w)
+              for n in z.namelist():
+                  b = z.read(n)
+                  if b[:2] == b"MZ":
+                      off = struct.unpack_from("<I", b, 0x3C)[0]
+                      out.append({"wheel": w, "member": n, "machine": hex(struct.unpack_from("<H", b, off + 4)[0])})
+              print(w)
+          print(json.dumps(out, indent=1))
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rerun-py-win-arm64
+          path: |
+            dist/*.whl
+            build-wheel.log
+
+  cli:
+    name: rerun-cli (${{ matrix.features }})
+    runs-on: windows-11-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [release_no_web_viewer, base]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: arm64
+      - name: Install rustup if missing
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain none --profile minimal
+            "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - name: Toolchain info
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustc -vV
+          (nasm -v || echo "no nasm")
+          (clang --version || true)
+      - name: Generate pyo3-build.cfg (what pixi activation normally does)
+        shell: bash
+        run: |
+          python -c "import sys; sys.path.insert(0, 'rerun_pixi_env/src'); from pathlib import Path; from rerun_pixi_env.pyo3_config import generate_config_file; generate_config_file(Path('rerun_py/pyo3-build.cfg'))"
+          cat rerun_py/pyo3-build.cfg
+      - name: Build rerun-cli
+        shell: bash
+        run: |
+          cargo build --locked --release -p rerun-cli --no-default-features \
+            --features "${{ matrix.features }}" 2>&1 | tee build-cli.log
+      - name: Smoke
+        shell: bash
+        run: |
+          ./target/release/rerun.exe --version
+          python - <<'EOF'
+          import struct
+          b = open("target/release/rerun.exe", "rb").read(4096)
+          off = struct.unpack_from("<I", b, 0x3C)[0]
+          print("PE machine", hex(struct.unpack_from("<H", b, off + 4)[0]))
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rerun-cli-win-arm64-${{ matrix.features }}
+          path: |
+            target/release/rerun.exe
+            build-cli.log
